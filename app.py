@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import pickle
@@ -45,9 +46,9 @@ model, le_dict = load_model()
 DEFAULT_MCH = 28.5
 DEFAULT_MCHC = 33.0
 DEFAULT_MCV = 90.0
-DEFAULT_RESULT = 0  # Negative
+DEFAULT_RESULT = 0
 
-# ---------------- CSV STORAGE SETUP ----------------
+# ---------------- CSV STORAGE ----------------
 def init_csv_storage():
     filename = "patient_records.csv"
     if not os.path.exists(filename):
@@ -306,6 +307,10 @@ def ir_to_hemoglobin(ir_value):
     hemo = MIN_HEMO + (ir_value - MIN_IR) / (MAX_IR - MIN_IR) * (MAX_HEMO - MIN_HEMO)
     return round(hemo, 2)
 
+def pressure_to_simulated(pressure_value):
+    """Map 0-100 pressure input to a simulated sensor reading range."""
+    return int(pressure_value * 10.23)
+
 # ---------------- BUZZER ----------------
 def trigger_buzzer():
     try:
@@ -315,8 +320,8 @@ def trigger_buzzer():
     except Exception as e:
         print("Buzzer error:", e)
 
-# ---------------- READ SENSOR ----------------
-def read_sensor():
+# ---------------- READ SENSOR (hardware) ----------------
+def read_sensor_hardware():
     if ser and ser.is_open:
         try:
             ser.reset_input_buffer()
@@ -345,6 +350,9 @@ for key, val in {
     "prediction_details": None,
     "show_records": False,
     "last_patient": None,
+    # Simulation inputs stored in session so they persist across reruns
+    "sim_hemo_input": 12.0,
+    "sim_pressure_input": 50,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = val
@@ -362,17 +370,15 @@ st.set_page_config(
 
 st.title("Anemia Risk Prediction System")
 
-# ---------------- HARDWARE STATUS BANNER ----------------
 if not HARDWARE_AVAILABLE:
     st.info(
-        "Manual Input Mode - Arduino hardware not detected. "
-        "You can manually enter hemoglobin and pressure values to use the prediction system. "
-        "To use hardware mode, run this app locally with your Arduino connected on COM3."
+        "Running in Simulation Mode - Arduino not detected. "
+        "The sensor steps are simulated using your manually entered values, "
+        "matching the same flow as the hardware version."
     )
 else:
     st.success("Arduino hardware connected and ready.")
 
-# Check model loaded
 if model is None:
     st.error(
         "Model files not found (xgboost_final_model.pkl / label_encoders.pkl). "
@@ -383,21 +389,13 @@ if model is None:
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
     st.header("How to Use")
-    if HARDWARE_AVAILABLE:
-        st.markdown("""
-1. Prepare Device - Connect Arduino to USB
-2. Blood Detection - Place finger on IR sensor
-3. Pressure Test - Apply gentle pressure
-4. Patient Details - Fill in information
+    st.markdown("""
+1. Blood Detection - Place finger on IR sensor (or enter value)
+2. Pressure Test - Apply gentle pressure (or enter value)
+3. Patient Details - Fill in information
+4. Predict - Click predict for results
 5. Follow Guidance - Review risk level
-        """)
-    else:
-        st.markdown("""
-1. Enter Values - Input hemoglobin and pressure manually
-2. Patient Details - Fill in information
-3. Predict - Click predict for results
-4. Follow Guidance - Review risk level
-        """)
+    """)
 
     st.markdown("---")
     st.header("Normal Ranges")
@@ -411,6 +409,27 @@ Optional Markers:
 - MCHC: 32-36 g/dL
 - MCV: 80-100 fL
     """)
+
+    # Simulation panel shown only in cloud/simulation mode
+    if not HARDWARE_AVAILABLE:
+        st.markdown("---")
+        st.header("Sensor Input Values")
+        st.caption("Set these before running each detection step.")
+        st.session_state.sim_hemo_input = st.number_input(
+            "Hemoglobin (g/dL)",
+            min_value=4.0, max_value=20.0,
+            value=float(st.session_state.sim_hemo_input),
+            step=0.1,
+            help="Normal: 12-16 g/dL (women), 13.5-18 g/dL (men)"
+        )
+        st.session_state.sim_pressure_input = st.number_input(
+            "Pressure Reading (0-100)",
+            min_value=0, max_value=100,
+            value=int(st.session_state.sim_pressure_input),
+            step=1,
+            help="Simulates the physical pressure sensor. Any value above 10 passes detection."
+        )
+        st.caption("These values simulate the Arduino sensor readings.")
 
     st.markdown("---")
     st.header("View Records")
@@ -456,120 +475,135 @@ Optional Markers:
         st.info("No previous patients found.")
 
 # ================================================================
-# HARDWARE MODE - Steps 1 & 2 via Arduino
+# LIVE SENSOR DISPLAY (steps 0-2 only)
 # ================================================================
-if HARDWARE_AVAILABLE:
-
-    if st.session_state.step < 3:
-        ir, pressure = read_sensor()
+if st.session_state.step < 3:
+    if HARDWARE_AVAILABLE:
+        ir, pressure = read_sensor_hardware()
         st.session_state.ir = ir
         st.session_state.pressure = pressure
+    else:
+        # Derive simulated IR from hemoglobin input (reverse calibration)
+        hemo = st.session_state.sim_hemo_input
+        MIN_IR, MAX_IR = 20000, 60000
+        MIN_HEMO, MAX_HEMO = 8.0, 18.0
+        sim_ir = MIN_IR + (hemo - MIN_HEMO) / (MAX_HEMO - MIN_HEMO) * (MAX_IR - MIN_IR)
+        sim_ir = max(MIN_IR, min(int(sim_ir), MAX_IR))
+        sim_pressure = pressure_to_simulated(st.session_state.sim_pressure_input)
+        st.session_state.ir = sim_ir
+        st.session_state.pressure = sim_pressure
 
-        st.subheader("Live Sensor Data")
-        c1, c2 = st.columns(2)
-        c1.metric("Blood IR", int(st.session_state.ir))
-        c2.metric("Pressure", int(st.session_state.pressure))
-        st.markdown("---")
+    st.subheader("Live Sensor Data")
+    c1, c2 = st.columns(2)
+    c1.metric("Blood IR", int(st.session_state.ir))
+    c2.metric("Pressure", int(st.session_state.pressure))
+    st.markdown("---")
 
-    if st.session_state.step == 0:
-        st.subheader("Step 1: Blood Detection")
-        st.info("Place your finger on the IR sensor and click Start Detection")
-        if st.button("Start Detection"):
-            st.session_state.detection_done = False
-            st.session_state.pressure_done = False
-            st.session_state.step = 1
+# ================================================================
+# STEP 0 - Start
+# ================================================================
+if st.session_state.step == 0:
+    st.subheader("Step 1: Blood Detection")
+    if not HARDWARE_AVAILABLE:
+        st.info("Simulation Mode: Set your hemoglobin value in the sidebar, then click Start Detection.")
+    else:
+        st.info("Place your finger on the IR sensor and click Start Detection.")
+    if st.button("Start Detection"):
+        st.session_state.detection_done = False
+        st.session_state.pressure_done = False
+        st.session_state.step = 1
+        st.rerun()
+
+# ================================================================
+# STEP 1 - Blood Detection
+# ================================================================
+if st.session_state.step == 1 and not st.session_state.detection_done:
+    st.subheader("Step 1: Blood Detection")
+
+    with st.status("Detecting finger...", expanded=True) as status:
+        st.write("Keep finger steady on the sensor")
+        st.write("Reading sensor data...")
+        time.sleep(2)
+
+        if HARDWARE_AVAILABLE:
+            ir, _ = read_sensor_hardware()
+            st.session_state.ir = ir
+        # In simulation mode, ir is already set from sidebar values above
+
+        IR_THRESHOLD = 20000
+
+        if st.session_state.ir < IR_THRESHOLD:
+            status.update(label="Detection failed!", state="error")
+            st.error(
+                f"Finger NOT detected (IR={int(st.session_state.ir)}, need >{IR_THRESHOLD})"
+            )
+            if not HARDWARE_AVAILABLE:
+                st.warning(
+                    "Your simulated hemoglobin value is too low. "
+                    "Increase the Hemoglobin value in the sidebar (minimum ~8 g/dL maps to IR 20000)."
+                )
+            else:
+                st.info("Tips: Place finger firmly, ensure sensor is clean, try repositioning.")
+            if st.button("Try Again"):
+                st.session_state.step = 0
+                st.rerun()
+        else:
+            status.update(label="Finger detected!", state="complete")
+            st.session_state.hemo = ir_to_hemoglobin(st.session_state.ir)
+            st.success(f"Blood detected! Hemoglobin: {st.session_state.hemo} g/dL")
+            st.session_state.detection_done = True
+            st.session_state.step = 2
+            time.sleep(1)
             st.rerun()
 
-    if st.session_state.step == 1 and not st.session_state.detection_done:
-        st.subheader("Step 1: Blood Detection")
-        with st.status("Detecting finger...", expanded=True) as status:
-            st.write("Keep finger steady on the sensor")
-            time.sleep(2)
-            ir, _ = read_sensor()
-            st.session_state.ir = ir
-            IR_THRESHOLD = 20000
-            if st.session_state.ir < IR_THRESHOLD:
-                status.update(label="Detection failed!", state="error")
-                st.error(f"Finger NOT detected (IR={int(st.session_state.ir)}, need >{IR_THRESHOLD})")
-                st.info("Tips: Place finger firmly, ensure sensor is clean, try repositioning")
-                if st.button("Try Again"):
-                    st.session_state.step = 0
-                    st.rerun()
-            else:
-                status.update(label="Finger detected!", state="complete")
-                st.session_state.hemo = ir_to_hemoglobin(st.session_state.ir)
-                st.success(f"Blood detected! Hemoglobin: {st.session_state.hemo} g/dL")
-                st.session_state.detection_done = True
-                st.session_state.step = 2
-                time.sleep(1)
-                st.rerun()
+# ================================================================
+# STEP 2 - Pressure Detection
+# ================================================================
+if st.session_state.step == 2 and not st.session_state.pressure_done:
+    st.subheader("Step 2: Pressure Detection")
 
-    if st.session_state.step == 2 and not st.session_state.pressure_done:
-        st.subheader("Step 2: Pressure Detection")
-        with st.status("Measuring pressure...", expanded=True) as status:
-            st.write("Apply gentle pressure to the sensor")
-            time.sleep(2)
-            _, pressure = read_sensor()
+    with st.status("Measuring pressure...", expanded=True) as status:
+        st.write("Apply gentle pressure to the sensor")
+        st.write("Reading pressure data...")
+        time.sleep(2)
+
+        if HARDWARE_AVAILABLE:
+            _, pressure = read_sensor_hardware()
             st.session_state.pressure = pressure
-            PRESSURE_THRESHOLD = 10
-            if st.session_state.pressure < PRESSURE_THRESHOLD:
-                status.update(label="Pressure detection failed!", state="error")
-                st.error(f"Pressure NOT detected (Pressure={int(st.session_state.pressure)}, need >{PRESSURE_THRESHOLD})")
-                st.info("Tips: Apply more pressure, hold steady for 2 seconds")
-                if st.button("Retry Pressure Test"):
-                    st.session_state.step = 1
-                    st.session_state.detection_done = False
-                    st.rerun()
-            else:
-                status.update(label="Pressure measured!", state="complete")
-                st.success(f"Pressure detected! Reading: {int(st.session_state.pressure)}")
-                st.session_state.pressure_done = True
-                st.session_state.step = 3
-                time.sleep(1)
-                st.rerun()
+        # In simulation mode, pressure is already set from sidebar values above
 
-# ================================================================
-# MANUAL MODE - Direct input when no hardware
-# ================================================================
-else:
-    if st.session_state.step == 0:
-        st.subheader("Step 1: Enter Sensor Values Manually")
+        PRESSURE_THRESHOLD = 10
 
-        col1, col2 = st.columns(2)
-        with col1:
-            manual_hemo = st.number_input(
-                "Hemoglobin (g/dL)",
-                min_value=4.0, max_value=20.0, value=12.0, step=0.1,
-                help="Normal: 12-16 g/dL (women), 13.5-18 g/dL (men)"
+        if st.session_state.pressure < PRESSURE_THRESHOLD:
+            status.update(label="Pressure detection failed!", state="error")
+            st.error(
+                f"Pressure NOT detected (Pressure={int(st.session_state.pressure)}, need >{PRESSURE_THRESHOLD})"
             )
-            st.caption("Enter the hemoglobin value from your blood test or estimate.")
-
-        with col2:
-            manual_pressure = st.number_input(
-                "Pressure Reading",
-                min_value=0, max_value=1023, value=50, step=1,
-                help="Pressure sensor reading. Enter any value above 10 to simulate detection."
-            )
-            st.caption("Simulated pressure value (must be greater than 10).")
-
-        if st.button("Confirm and Proceed", type="primary"):
-            if manual_pressure < 10:
-                st.error("Pressure value must be greater than 10 to simulate detection.")
+            if not HARDWARE_AVAILABLE:
+                st.warning(
+                    "Your simulated pressure value is too low. "
+                    "Increase the Pressure Reading value in the sidebar (must be above 1 to pass)."
+                )
             else:
-                st.session_state.hemo = round(manual_hemo, 2)
-                st.session_state.pressure = manual_pressure
-                st.session_state.ir = 0
-                st.session_state.detection_done = True
-                st.session_state.pressure_done = True
-                st.session_state.step = 3
+                st.info("Tips: Apply more pressure, hold steady for 2 seconds.")
+            if st.button("Retry Pressure Test"):
+                st.session_state.step = 1
+                st.session_state.detection_done = False
                 st.rerun()
+        else:
+            status.update(label="Pressure measured!", state="complete")
+            st.success(f"Pressure detected! Reading: {int(st.session_state.pressure)}")
+            st.session_state.pressure_done = True
+            st.session_state.step = 3
+            time.sleep(1)
+            st.rerun()
 
 # ================================================================
-# STEP 3 - Patient Details + Prediction (shared by both modes)
+# STEP 3 - Patient Details + Prediction
 # ================================================================
 if st.session_state.step >= 3:
 
-    st.success("Sensor values captured successfully.")
+    st.success("Sensors captured successfully!")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -811,7 +845,9 @@ if st.session_state.step >= 3:
             st.markdown(guidance["message"])
 
         with st.expander("Dietary Recommendations", expanded=True):
-            dietary_advice = get_dietary_recommendations(risk, st.session_state.prediction_details['diet'])
+            dietary_advice = get_dietary_recommendations(
+                risk, st.session_state.prediction_details['diet']
+            )
             st.markdown(dietary_advice)
 
         with st.expander("Understanding Your Results"):
